@@ -1,0 +1,33 @@
+datasets/
+TraC/datasets/
+TraC/datasets_variants/
+TraC/logs/
+TraC/exp/
+TraC/exp_safetygym/
+*__pycache__
+OSRL/models/
+OSRL/logs/
+OSRL/tmp_wandb/
+OSRL/wandb/
+**/models/
+
+# Environments
+.conda/
+env/
+venv/
+
+# Datasets and Weights
+*.pkl
+*.hdf5
+*.pt
+*.pth
+
+# WandB and Logs
+wandb/
+tmp_wandb/
+*.mp4
+*.png
+
+# Python Cache
+__pycache__/
+*.pyc
