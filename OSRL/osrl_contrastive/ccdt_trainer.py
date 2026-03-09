@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 from osrl.algorithms import CDTTrainer
 import wandb
+from pytorch_metric_learning.losses import NTXentLoss
 
 class ContrastiveCDTTrainer(CDTTrainer): 
     def __init__(self, model, env, contrastive_weight=0.1, temperature=0.1, 

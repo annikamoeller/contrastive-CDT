@@ -28,6 +28,7 @@ class ContrastiveCDTTrainConfig(CDTTrainConfig):
     contrastive_weight: float = 0.1
     temperature: float = 0.1
     probe_every: int = 5000            
+    eval_episodes: int = 5      
 
 @pyrallis.wrap()
 def train(args: ContrastiveCDTTrainConfig):
@@ -106,7 +107,7 @@ def train(args: ContrastiveCDTTrainConfig):
         no_entropy=args.no_entropy,
         device=args.device
     )
-
+        
     # --- DATASET SETUP ---
     dataset = SequenceDataset(
         data, seq_len=args.seq_len, reward_scale=args.reward_scale,
@@ -151,9 +152,29 @@ def train(args: ContrastiveCDTTrainConfig):
             # Pass num_buckets to the probe so t-SNE colors match your labels
             evaluate_representations(trainer, trainloader, args.device, step, num_buckets=args.num_buckets)
 
-        if (step + 1) % args.eval_every == 0:
-            # Standard OSRL eval logic here...
-            pass
+        if (step + 1) % args.eval_every == 0 or step == args.update_steps - 1:
+            average_reward, average_cost = [], []
+            for target_return in args.target_returns:
+                reward_to_go, cost_to_go = target_return
+
+                # This calls your new vectorized evaluate method
+                ret, cost, length = trainer.evaluate(
+                    num_rollouts=args.eval_episodes, 
+                    target_return=reward_to_go * args.reward_scale,
+                    target_cost=cost_to_go * args.cost_scale
+                )
+
+                average_cost.append(cost)
+                average_reward.append(ret)
+
+                # Log to WandB
+                name = f"c_{int(cost_to_go)}_r_{int(reward_to_go)}"
+                logger.store(tab="cost", **{name: cost})
+                logger.store(tab="ret", **{name: ret})
+                logger.store(tab="length", **{name: length})
+
+            logger.write(step, display=False)
+            logger.save_checkpoint()
 
 if __name__ == "__main__":
     train()
