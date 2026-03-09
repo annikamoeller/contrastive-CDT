@@ -4,17 +4,27 @@ from osrl.common.net import DiagGaussianActor, TransformerBlock, mlp
 from osrl.algorithms import CDT
 import torch.nn.functional as F
 
-class ContrastiveCDT(CDT): # Inherit from your original CDT
-    def __init__(self, contrastive_dim: int = 64, **kwargs):
+class ContrastiveCDT(CDT): 
+    def __init__(self, contrastive_dim: int = 128, **kwargs):
         super().__init__(**kwargs)
         self.contrastive_dim = contrastive_dim
         
-        # The projection head maps the transformer's output to the latent space
+        # SimCLR-style deep projection head
         self.contrastive_head = nn.Sequential(
             nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.LayerNorm(self.embedding_dim),
             nn.GELU(),
             nn.Linear(self.embedding_dim, contrastive_dim)
         )
+
+    def get_latents(self, state_emb, action_emb, cost_emb):
+        # "Product" mechanism: condition the representation on the cost budget
+        state_conditioned = state_emb * cost_emb
+        action_conditioned = action_emb * cost_emb
+        
+        # Combine and project
+        s_a_stack = state_conditioned + action_conditioned
+        return self.contrastive_head(s_a_stack)
 
     def forward(self, states, actions, returns_to_go, costs_to_go, time_steps, padding_mask=None, episode_cost=None, return_latents=False):
         batch_size, seq_len = states.shape[0], states.shape[1]
@@ -28,6 +38,7 @@ class ContrastiveCDT(CDT): # Inherit from your original CDT
         if self.cost_transform is not None:
             costs_to_go = self.cost_transform(costs_to_go.detach())
 
+        costs_emb = None
         if self.use_cost:
             costs_emb = self.cost_emb(costs_to_go.unsqueeze(-1)) + timestep_emb
             seq_list.insert(0, costs_emb)
@@ -75,10 +86,8 @@ class ContrastiveCDT(CDT): # Inherit from your original CDT
         state_preds = self.state_pred_head(action_feature)
         
         # --- GET LATENTS ---
-        latents = self.contrastive_head(action_feature)
-        
-        if return_latents:
-            latents = self.contrastive_head(action_feature)
+        if return_latents and costs_emb is not None:
+            latents = self.get_latents(state_emb, act_emb, costs_emb)
             return action_preds, cost_preds, state_preds, latents
         else:
             return action_preds, cost_preds, state_preds

@@ -4,64 +4,20 @@ import numpy as np
 from osrl.algorithms import CDTTrainer
 import wandb
 
-class ContrastiveCDTTrainer(CDTTrainer): # Inherit to keep evaluate() and rollout()
+class ContrastiveCDTTrainer(CDTTrainer): 
     def __init__(self, model, env, contrastive_weight=0.1, temperature=0.1, 
-                 discretization="binary", **kwargs):
+                 num_buckets=2, max_expected_cost=100.0, **kwargs):
         super().__init__(model, env, **kwargs)
         self.contrastive_weight = contrastive_weight
-        self.temperature = temperature
-        self.discretization = discretization # "binary" or "granular"
-
-    def compute_contrastive_loss(self, latents, costs, mask):
-        flat_latents = F.normalize(latents[mask > 0], dim=1)
-        flat_costs = costs[mask > 0]
+        self.num_buckets = num_buckets
+        self.max_expected_cost = max_expected_cost
         
-        sim_matrix = torch.matmul(flat_latents, flat_latents.T) / self.temperature
-        
-        # --- THESIS AXIS: Discretization Strategy ---
-        if self.discretization == "binary":
-            # Strict Safe (0) vs Unsafe (>0)
-            safety_labels = (flat_costs == 0).float()
-            pos_mask = torch.eq(safety_labels.unsqueeze(0), safety_labels.unsqueeze(1)).float()
-        elif self.discretization == "granular":
-            # Binned by strict cost similarity (e.g. costs within 0.1 of each other)
-            cost_diff = torch.abs(flat_costs.unsqueeze(0) - flat_costs.unsqueeze(1))
-            pos_mask = (cost_diff < (0.1 * self.cost_scale)).float()
-        else:
-            raise ValueError("Unknown discretization strategy")
-
-        # InfoNCE Math
-        logits_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
-        logits = sim_matrix - logits_max.detach()
-        mask_self = torch.eye(logits.shape[0], device=self.device)
-        
-        exp_logits = torch.exp(logits)
-        denom = (exp_logits * (1 - mask_self)).sum(1, keepdim=True)
-        log_prob = logits - torch.log(denom + 1e-6)
-        
-        pos_pairs_mask = pos_mask * (1 - mask_self)
-        loss = - (pos_pairs_mask * log_prob).sum(1) / (pos_pairs_mask.sum(1) + 1e-6)
-        
-        # Track metrics for WandB
-        with torch.no_grad():
-            pos_dist = (sim_matrix * pos_pairs_mask).sum() / pos_pairs_mask.sum()
-            neg_dist = (sim_matrix * (1 - pos_mask)).sum() / (1 - pos_mask).sum()
-
-        return loss.mean(), pos_dist.item(), neg_dist.item()
+        # The metric learning standard
+        self.ntxent_loss = NTXentLoss(temperature=temperature)
 
     def train_one_step(self, states, actions, returns, costs_return, time_steps, mask, episode_cost, costs, is_pretraining=False):
         
-        # Flatten explicit pairs if they exist
-        if states.dim() == 4: # Shape: [Batch, 2, seq_len, dim]
-            B, num_pairs, seq_len = states.shape[0], states.shape[1], states.shape[2]
-            states = states.view(-1, seq_len, states.shape[-1])
-            actions = actions.view(-1, seq_len, actions.shape[-1])
-            returns = returns.view(-1, seq_len)
-            costs_return = costs_return.view(-1, seq_len)
-            time_steps = time_steps.view(-1, seq_len)
-            mask = mask.view(-1, seq_len)
-            episode_cost = episode_cost.view(-1)
-            costs = costs.view(-1, seq_len)
+        # (Removed the explicit pair flattening logic since we use standard batches now)
             
         padding_mask = ~mask.to(torch.bool)
         
@@ -89,14 +45,22 @@ class ContrastiveCDTTrainer(CDTTrainer): # Inherit to keep evaluate() and rollou
         state_loss = F.mse_loss(state_preds[:, :-1], states[:, 1:].detach(), reduction="none")
         state_loss = (state_loss * mask[:, :-1].unsqueeze(-1)).mean()
 
-        # Contrastive loss
-        cont_loss, pos_dist, neg_dist = self.compute_contrastive_loss(latents, costs_return, mask)
-
-        # --- THESIS AXIS: Optimization Strategy ---
-        if is_pretraining:
-            loss = cont_loss # Only train the representation
+        # --- Contrastive loss & Dynamic Bucketing ---
+        flat_latents = latents[mask > 0]
+        flat_costs = costs[mask > 0]
+        
+        if self.num_buckets == 2:
+            labels = (flat_costs > 0).long() # 0 for safe, 1 for unsafe
         else:
-            # Joint training
+            bin_size = self.max_expected_cost / float(self.num_buckets)
+            labels = torch.clamp((flat_costs / bin_size).long(), 0, self.num_buckets - 1)
+            
+        cont_loss = self.ntxent_loss(flat_latents, labels)
+
+        # Optimization Strategy
+        if is_pretraining:
+            loss = cont_loss 
+        else:
             loss = act_loss + self.cost_weight * cost_loss + self.state_weight * state_loss + self.contrastive_weight * cont_loss
 
         self.optim.zero_grad()
@@ -111,17 +75,97 @@ class ContrastiveCDTTrainer(CDTTrainer): # Inherit to keep evaluate() and rollou
             tab="train",
             total_loss=loss.item(),
             cont_loss=cont_loss.item(),
-            pos_sim=pos_dist,  # Should go UP
-            neg_sim=neg_dist,  # Should go DOWN
+            act_loss=act_loss.item() if not is_pretraining else 0.0
         )
         
+    @torch.no_grad()
     def evaluate(self, num_rollouts, target_return, target_cost):
-        # 1. Official metric evaluation
-        print(f"\n[Eval] Calculating metrics for target_cost: {target_cost}...")
-        ret, cost, length = super().evaluate(num_rollouts, target_return, target_cost)
-        print(f"[Eval] Results: Reward={ret:.2f}, Cost={cost:.2f}, Avg Len={length:.1f}")
+        import gymnasium as gym
+        import numpy as np
+        import wandb
+        
+        print(f"\n[Eval] Running {num_rollouts} parallel rollouts for target_cost: {target_cost}...")
+        self.model.eval()
+        
+        # ==========================================
+        # 1. FAST VECTORIZED EVALUATION (For Metrics)
+        # ==========================================
+        env_id = self.env.unwrapped.spec.id
+        vec_env = gym.vector.make(env_id, num_envs=num_rollouts, asynchronous=True)
+        obs, _ = vec_env.reset()
+        
+        device = self.device
+        seq_len = self.model.seq_len
+        
+        states = torch.zeros((num_rollouts, seq_len, self.model.state_dim), dtype=torch.float32, device=device)
+        actions = torch.zeros((num_rollouts, seq_len, self.model.action_dim), dtype=torch.float32, device=device)
+        returns = torch.zeros((num_rollouts, seq_len, 1), dtype=torch.float32, device=device)
+        costs = torch.zeros((num_rollouts, seq_len, 1), dtype=torch.float32, device=device)
+        time_steps = torch.zeros((num_rollouts, seq_len), dtype=torch.long, device=device)
+        
+        episode_returns = np.zeros(num_rollouts)
+        episode_costs = np.zeros(num_rollouts)
+        episode_lengths = np.zeros(num_rollouts)
+        active_envs = np.ones(num_rollouts, dtype=bool)
+        
+        target_return_tensor = torch.tensor([target_return] * num_rollouts, device=device, dtype=torch.float32)
+        target_cost_tensor = torch.tensor([target_cost] * num_rollouts, device=device, dtype=torch.float32)
+        ep_costs_tensor = torch.zeros((num_rollouts, 1), device=device, dtype=torch.float32)
+        
+        t = 0
+        while active_envs.any():
+            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
+            states[:, t % seq_len] = obs_tensor
+            time_steps[:, t % seq_len] = t
+            returns[:, t % seq_len] = target_return_tensor.unsqueeze(-1)
+            costs[:, t % seq_len] = target_cost_tensor.unsqueeze(-1)
+            
+            if t < seq_len:
+                seq_s, seq_a = states[:, :t+1], actions[:, :t+1]
+                seq_r, seq_c, seq_t = returns[:, :t+1], costs[:, :t+1], time_steps[:, :t+1]
+            else:
+                idx = torch.arange(t - seq_len + 1, t + 1) % seq_len
+                seq_s, seq_a = states[:, idx], actions[:, idx]
+                seq_r, seq_c, seq_t = returns[:, idx], costs[:, idx], time_steps[:, idx]
+                
+            action_preds, _, _ = self.model(
+                states=seq_s, actions=seq_a, returns_to_go=seq_r, costs_to_go=seq_c, 
+                time_steps=seq_t, episode_cost=ep_costs_tensor
+            )
+            
+            current_actions = action_preds[:, -1]
+            if self.stochastic:
+                current_actions = current_actions.mean 
+            
+            actions[:, t % seq_len] = current_actions
+            cpu_actions = current_actions.cpu().numpy()
+            
+            obs, rews, terminateds, truncateds, infos = vec_env.step(cpu_actions)
+            dones = terminateds | truncateds
+            
+            for i in range(num_rollouts):
+                if active_envs[i]:
+                    episode_returns[i] += rews[i]
+                    step_cost = infos["cost"][i] if "cost" in infos else 0.0
+                    episode_costs[i] += step_cost
+                    episode_lengths[i] += 1
+                    
+                    target_return_tensor[i] -= rews[i]
+                    target_cost_tensor[i] -= step_cost
+                    ep_costs_tensor[i] += step_cost
+                    if dones[i]: active_envs[i] = False
+            t += 1
+            
+        vec_env.close()
+        
+        avg_return = np.mean(episode_returns)
+        avg_cost = np.mean(episode_costs)
+        avg_length = np.mean(episode_lengths)
+        print(f"[Eval] Results: Reward={avg_return:.2f}, Cost={avg_cost:.2f}, Avg Len={avg_length:.1f}")
 
-        # 2. Recording the thesis video
+        # ==========================================
+        # 2. THESIS VIDEO RECORDING (Single Env)
+        # ==========================================
         if wandb.run is not None:
             try:
                 print(f"🎥 Recording video for target_cost {target_cost}...")
@@ -129,30 +173,24 @@ class ContrastiveCDTTrainer(CDTTrainer): # Inherit to keep evaluate() and rollou
                 original_step = self.env.step
                 
                 def step_with_video(action):
-                    obs, reward, terminated, truncated, info = original_step(action)
+                    step_obs, step_rew, step_term, step_trunc, step_info = original_step(action)
                     frame = self.env.unwrapped.render(mode="rgb_array")
                     if frame is not None:
                         frames.append(frame)
-                    return obs, reward, terminated, truncated, info
+                    return step_obs, step_rew, step_term, step_trunc, step_info
                 
                 self.env.step = step_with_video
                 
-                # Setup environment
                 self.env.reset()
-                frame = self.env.unwrapped.render(mode="rgb_array")
-                if frame is not None:
-                    frames.append(frame)
+                first_frame = self.env.unwrapped.render(mode="rgb_array")
+                if first_frame is not None:
+                    frames.append(first_frame)
                 
-                # Execute rollout
-                self.model.eval()
-                # self.rollout returns the results of this specific video run
+                # Do 1 visual rollout using the parent class method
                 _, vid_len, _ = self.rollout(self.model, self.env, target_return, target_cost)
-                self.model.train()
                 
-                # Restore environment
                 self.env.step = original_step
                 
-                # 3. Save and Upload
                 if len(frames) > 0:
                     print(f"📦 Processing {len(frames)} frames into MP4 (Length: {vid_len})...")
                     video_array = np.array(frames)
@@ -169,4 +207,5 @@ class ContrastiveCDTTrainer(CDTTrainer): # Inherit to keep evaluate() and rollou
                 print(f"\n❌ [Warning] Video logging failed: {e}")
                 self.env.step = original_step 
 
-        return ret, cost, length
+        self.model.train()
+        return avg_return, avg_cost, avg_length
