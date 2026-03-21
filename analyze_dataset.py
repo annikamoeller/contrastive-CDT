@@ -110,6 +110,6 @@ def analyze_dataset(file_path, task_name):
     print(f"\n✅ Plot saved successfully as {save_name}!")
 
 if __name__ == "__main__":    
-    analyze_dataset("datasets/SafetyCarRun-v0-40-651.hdf5", "CarRun")
-    analyze_dataset("datasets/SafetyPointCircle1Gymnasium-v0-200-1098.hdf5", "PointGoal")
-    analyze_dataset("datasets/SafetyPointGoal1Gymnasium-v0-100-2022.hdf5", "PointCircle")
+    analyze_dataset("datasets/SafetyAntRun-v0-150-1816.hdf5", "AntRun")
+    analyze_dataset("datasets/SafetyCarCircle-v0-100-1450.hdf5", "CarCircle")
+    analyze_dataset("datasets/SafetyCarGoal1Gymnasium-v0-120-1671.hdf5", "CarGoal")

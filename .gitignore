@@ -27,7 +27,10 @@ wandb/
 tmp_wandb/
 *.mp4
 *.png
+logs/
 
 # Python Cache
 __pycache__/
 *.pyc
+
+Contrastive-Decision-Transformers/

@@ -7,36 +7,36 @@ from sklearn.manifold import TSNE
 from sklearn.metrics import silhouette_score
 
 @torch.no_grad()
-def evaluate_representations(trainer, dataloader, device, step, num_buckets=2, max_expected_cost=100.0):
+def evaluate_representations(trainer, dataloader, device, step, num_buckets=2):
     trainer.model.eval()
     all_latents = []
-    all_costs = []
+    all_ep_costs = []
     
     # Collect a large batch of latents
     for batch in dataloader:
         states, actions, returns, costs_return, time_steps, mask, ep_cost, costs = [b.to(device) for b in batch]
         _, _, _, latents = trainer.model(states, actions, returns, costs_return, time_steps, return_latents=True)
         
-        # Mask out padding
+        # Mask out padding for latents
         valid_latents = latents[mask > 0]
-        valid_costs = costs[mask > 0] # Using actual timestep cost
         
+        # Expand the [Batch, 1] episode cost to match the [Batch, Seq_Len] 
+        # before masking, so every valid step inherits its trajectory's total cost.
+        expanded_ep_cost = ep_cost.unsqueeze(1).expand(-1, latents.shape[1])
+        valid_ep_costs = expanded_ep_cost[mask > 0]
+    
         all_latents.append(valid_latents.cpu().numpy())
-        all_costs.append(valid_costs.cpu().numpy())
+        all_ep_costs.append(valid_ep_costs.cpu().numpy())
         
         if len(all_latents) > 10: 
             break
             
     X = np.concatenate(all_latents, axis=0)
-    costs = np.concatenate(all_costs, axis=0)
-    
-    # Dynamic Labeling
-    if num_buckets == 2:
-        y_labels = (costs > 0).astype(int) 
-    else:
-        bin_size = max_expected_cost / float(num_buckets)
-        y_labels = np.clip(np.floor(costs / bin_size).astype(int), 0, num_buckets - 1)
+    ep_costs = np.concatenate(all_ep_costs, axis=0)
 
+    boundaries = trainer.cost_boundaries.cpu().numpy()
+    y_labels = np.digitize(ep_costs, boundaries)
+    
     # 1. Linear Probing (Handles multi-class natively via OvR)
     clf = LogisticRegression(max_iter=1000).fit(X, y_labels)
     probe_acc = clf.score(X, y_labels)

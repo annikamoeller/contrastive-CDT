@@ -7,26 +7,22 @@ from pytorch_metric_learning.losses import NTXentLoss
 
 class ContrastiveCDTTrainer(CDTTrainer): 
     def __init__(self, model, env, contrastive_weight=0.1, temperature=0.1, 
-                 num_buckets=2, max_expected_cost=100.0, **kwargs):
+                 num_buckets=2, cost_boundaries=None, **kwargs):
         super().__init__(model, env, **kwargs)
         self.contrastive_weight = contrastive_weight
         self.num_buckets = num_buckets
-        self.max_expected_cost = max_expected_cost
-        
-        # The metric learning standard
+        self.cost_boundaries = torch.tensor(cost_boundaries, device=self.device)
         self.ntxent_loss = NTXentLoss(temperature=temperature)
-
-    def train_one_step(self, states, actions, returns, costs_return, time_steps, mask, episode_cost, costs, is_pretraining=False):
         
-        # (Removed the explicit pair flattening logic since we use standard batches now)
-            
+    def train_one_step(self, states, actions, returns, costs_return, time_steps, mask, episode_cost, costs, is_pretraining=False):
         padding_mask = ~mask.to(torch.bool)
         
+        # 1. Forward Pass
         action_preds, cost_preds, state_preds, latents = self.model(
             states, actions, returns, costs_return, time_steps, padding_mask, episode_cost, return_latents=True
         )
 
-        # Standard losses
+        # 2. Standard Decision Transformer Losses
         if self.stochastic:
             log_likelihood = action_preds.log_prob(actions)[mask > 0].mean()
             entropy = action_preds.entropy()[mask > 0].mean()
@@ -38,32 +34,66 @@ class ContrastiveCDTTrainer(CDTTrainer):
             act_loss = F.mse_loss(action_preds, actions.detach(), reduction="none")
             act_loss = (act_loss * mask.unsqueeze(-1)).mean()
 
+        # Cost Prediction Loss (NLL for classification)
         cost_preds_flat = cost_preds.reshape(-1, 2)
         costs_flat = costs.flatten().long().detach()
         cost_loss = F.nll_loss(cost_preds_flat, costs_flat, reduction="none")
         cost_loss = (cost_loss * mask.flatten()).mean()
 
+        # State Prediction Loss (Next-state dynamics)
         state_loss = F.mse_loss(state_preds[:, :-1], states[:, 1:].detach(), reduction="none")
         state_loss = (state_loss * mask[:, :-1].unsqueeze(-1)).mean()
 
-        # --- Contrastive loss & Dynamic Bucketing ---
+        # 3. Contrastive Task: Trajectory-Aware Bucketing
         flat_latents = latents[mask > 0]
-        flat_costs = costs[mask > 0]
         
-        if self.num_buckets == 2:
-            labels = (flat_costs > 0).long() # 0 for safe, 1 for unsafe
-        else:
-            bin_size = self.max_expected_cost / float(self.num_buckets)
-            labels = torch.clamp((flat_costs / bin_size).long(), 0, self.num_buckets - 1)
-            
-        cont_loss = self.ntxent_loss(flat_latents, labels)
+        # FIX 1: Crush episode_cost to a pure 1D tensor [Batch] to destroy hidden dimensions
+        ep_cost_1d = episode_cost.view(-1)
+        traj_labels = torch.bucketize(ep_cost_1d, self.cost_boundaries).long()
 
-        # Optimization Strategy
+        # FIX 3: Memory-safe broadcast to [Batch, Seq_Len] using expand instead of repeat
+        seq_len = states.shape[1]
+        batch_labels = traj_labels.unsqueeze(1).expand(-1, seq_len)
+        
+        # Apply mask so flat_labels matches flat_latents exactly
+        flat_labels = batch_labels[mask > 0].long()
+        
+        # --- THE ANTI-OOM SHIELD (Subsampling) ---
+        MAX_SAMPLES = 128
+        if flat_latents.shape[0] > MAX_SAMPLES:
+            # Pick 128 random valid steps to calculate contrastive loss
+            idx = torch.randperm(flat_latents.shape[0], device=self.device)[:MAX_SAMPLES]
+            flat_latents = flat_latents[idx]
+            flat_labels = flat_labels[idx]
+
+        # Debug Prints (~1% of batches)
+        if not is_pretraining and torch.rand(1) < 0.01:
+            unique_labels, counts = torch.unique(flat_labels, return_counts=True)
+            print(f"\n[DEBUG TRAIN]")
+            print(f"  - Label Distribution: {dict(zip(unique_labels.tolist(), counts.tolist()))}")
+            print(f"  - Avg Episode Cost in Batch: {episode_cost.mean().item():.2f}")
+            if len(unique_labels) < 2:
+                print("  ⚠️ WARNING: All labels identical. Contrastive loss will be 0.")
+        
+        # Safety check: Replace NaNs with 0s
+        if torch.isnan(flat_latents).any():
+            flat_latents = torch.nan_to_num(flat_latents)
+            
+        # Calculate Contrastive Loss
+        if len(torch.unique(flat_labels)) > 1:
+            cont_loss = self.ntxent_loss(flat_latents, flat_labels)
+        else:
+            cont_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # 4. Optimization Strategy
         if is_pretraining:
             loss = cont_loss 
         else:
-            loss = act_loss + self.cost_weight * cost_loss + self.state_weight * state_loss + self.contrastive_weight * cont_loss
-
+            loss = (act_loss + 
+                    self.cost_weight * cost_loss + 
+                    self.state_weight * state_loss + 
+                    self.contrastive_weight * cont_loss)            
+            
         self.optim.zero_grad()
         loss.backward()
         if self.clip_grad is not None:
@@ -71,14 +101,16 @@ class ContrastiveCDTTrainer(CDTTrainer):
         self.optim.step()
         self.scheduler.step()
 
-        # Log to WandB
+        # 5. Log to WandB
         self.logger.store(
             tab="train",
             total_loss=loss.item(),
             cont_loss=cont_loss.item(),
-            act_loss=act_loss.item() if not is_pretraining else 0.0
+            act_loss=act_loss.item() if not is_pretraining else 0.0,
+            cost_loss=cost_loss.item() if not is_pretraining else 0.0,
+            num_buckets=len(torch.unique(flat_labels))
         )
-        
+    
     @torch.no_grad()
     def evaluate(self, num_rollouts, target_return, target_cost):
         import gymnasium as gym
@@ -129,14 +161,19 @@ class ContrastiveCDTTrainer(CDTTrainer):
                 seq_s, seq_a = states[:, idx], actions[:, idx]
                 seq_r, seq_c, seq_t = returns[:, idx], costs[:, idx], time_steps[:, idx]
                 
-            action_preds, _, _ = self.model(
+            outputs = self.model(
                 states=seq_s, actions=seq_a, returns_to_go=seq_r, costs_to_go=seq_c, 
                 time_steps=seq_t, episode_cost=ep_costs_tensor
             )
             
-            current_actions = action_preds[:, -1]
+            # Unpack the tuple
+            action_dist = outputs[0] 
+
             if self.stochastic:
-                current_actions = current_actions.mean 
+                # IMPORTANT: Access .mean FIRST, then slice [:, -1]
+                current_actions = action_dist.mean[:, -1] 
+            else:
+                current_actions = action_dist[:, -1]
             
             actions[:, t % seq_len] = current_actions
             cpu_actions = current_actions.cpu().numpy()
