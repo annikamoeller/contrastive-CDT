@@ -6,7 +6,7 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 
 from osrl.algorithms import CDT
-from osrl_contrastive.ccdt import ContrastiveCDT
+from osrl_contrastive.ccdt import ContrastiveCDTFront, ContrastiveCDTBack
 
 @torch.no_grad()
 def evaluate_model_adherence(model, env_id, target_costs, target_return, num_rollouts, device="cuda"):
@@ -111,7 +111,7 @@ def main():
     vanilla_model.load_state_dict(torch.load(args.vanilla_weights, map_location=args.device))
 
     print("Loading Contrastive CDT...")
-    ccdt_model = ContrastiveCDT(state_dim=state_dim, action_dim=action_dim, max_action=max_action, seq_len=20, embedding_dim=128, contrastive_dim=64).to(args.device)
+    ccdt_model = ContrastiveCDTBack(state_dim=state_dim, action_dim=action_dim, max_action=max_action, seq_len=20, embedding_dim=128, contrastive_dim=64).to(args.device)
     ccdt_model.load_state_dict(torch.load(args.ccdt_weights, map_location=args.device))
 
     # Define the sweep grid

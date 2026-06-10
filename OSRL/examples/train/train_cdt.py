@@ -50,8 +50,10 @@ def train(args: CDTTrainConfig):
 
     # initialize environment
     if "Metadrive" in args.task:
-        import gym
-    env = gym.make(args.task)
+        import gym as old_gym
+        env = old_gym.make(args.task)
+    else:
+        env = gym.make(args.task)
 
     # pre-process offline dataset
     data = env.get_dataset()

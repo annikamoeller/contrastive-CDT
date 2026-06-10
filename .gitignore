@@ -28,6 +28,7 @@ tmp_wandb/
 *.mp4
 *.png
 logs/
+logs_real/
 
 # Python Cache
 __pycache__/

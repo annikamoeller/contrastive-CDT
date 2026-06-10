@@ -1,7 +1,5 @@
 from dataclasses import asdict, dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Tuple
-import os
-import yaml
 
 import dsrl
 import numpy as np
@@ -11,37 +9,8 @@ from dsrl.offline_env import OfflineEnvWrapper, wrap_env  # noqa
 from pyrallis import field
 
 from osrl.algorithms import CDT, CDTTrainer
-from osrl.common.exp_util import seed_all # Removed load_config_and_model import
+from osrl.common.exp_util import load_config_and_model, seed_all
 
-# ... existing imports ...
-import yaml # Make sure this is imported
-
-def custom_load_config_and_model(path: str, best: bool = False, device: str = "cpu"):
-    """
-    Loads config and model with safe device mapping AND unsafe YAML loading (for tuples).
-    """
-    if os.path.isfile(path):
-        model_path = path
-        config_path = os.path.join(os.path.dirname(os.path.dirname(path)), "config.yaml")
-    else:
-        config_path = os.path.join(path, "config.yaml")
-        if best:
-            model_path = os.path.join(path, "checkpoint", "model_best.pt")
-        else:
-            model_path = os.path.join(path, "checkpoint", "model.pt")
-
-    print(f"load config from {config_path}")
-    with open(config_path, "r") as f:
-        # FIX: Use UnsafeLoader to handle !!python/tuple tags in the config
-        cfg = yaml.load(f, Loader=yaml.UnsafeLoader)
-
-    print(f"load model from {model_path}")
-    
-    # FIX: Force map_location to the specified device
-    model = torch.load(model_path, map_location=device) 
-    
-    return cfg, model
-# --------------------------------------------------------
 
 @dataclass
 class EvalConfig:
@@ -57,10 +26,8 @@ class EvalConfig:
 
 @pyrallis.wrap()
 def eval(args: EvalConfig):
-    # USE THE CUSTOM LOAD FUNCTION HERE
-    # We pass args.device so it loads directly to CPU or the correct GPU 0
-    cfg, model = custom_load_config_and_model(args.path, args.best, device=args.device)
-    
+
+    cfg, model = load_config_and_model(args.path, args.best)
     seed_all(cfg["seed"])
     if args.device == "cpu":
         torch.set_num_threads(args.threads)
@@ -105,12 +72,7 @@ def eval(args: EvalConfig):
         init_temperature=cfg["init_temperature"],
         target_entropy=target_entropy,
     )
-    
-    # Ensure the model dictionary is loaded correctly into the structure
-    # (Sometimes checkpoint is just state_dict, sometimes it's a dict containing 'model_state')
-    state_dict = model["model_state"] if "model_state" in model else model
-    cdt_model.load_state_dict(state_dict)
-    
+    cdt_model.load_state_dict(model["model_state"])
     cdt_model.to(args.device)
 
     trainer = CDTTrainer(cdt_model,

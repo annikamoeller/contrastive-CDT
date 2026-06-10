@@ -1,0 +1,8 @@
+TraC/
+logs/
+logs_real/
+.vscode
+.git
+.gitignore
+OSRL/
+OSRL_continued/logs

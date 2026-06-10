@@ -51,7 +51,7 @@ def get_cost_boundaries(data: dict, num_buckets: int) -> list:
 class ContrastiveCDTTrainConfig(CDTTrainConfig):
     num_buckets: int = 2               
     pretrain_steps: int = 0            
-    update_steps: int = 20_000          
+    update_steps: int = 100_000          
     contrastive_dim: int = 64
     contrastive_weight: float = 0.1
     temperature: float = 0.1
